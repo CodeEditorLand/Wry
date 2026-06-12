@@ -352,6 +352,7 @@ mod custom_protocol_workaround;
 mod error;
 #[cfg(any(target_os = "android", test))]
 mod inject_initialization_scripts;
+mod permissions;
 mod proxy;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod util;
@@ -411,6 +412,7 @@ pub use cookie;
 pub use dpi;
 pub use error::*;
 pub use http;
+pub use permissions::{PermissionKind, PermissionResponse};
 pub use proxy::{ProxyConfig, ProxyEndpoint};
 pub use web_context::WebContext;
 
@@ -519,9 +521,6 @@ pub struct NewWindowOpener {
   #[cfg(target_os = "macos")]
   pub target_configuration: Retained<objc2_web_kit::WKWebViewConfiguration>,
 }
-
-unsafe impl Send for NewWindowOpener {}
-unsafe impl Sync for NewWindowOpener {}
 
 /// Window features of a window requested to open.
 #[non_exhaustive]
@@ -791,6 +790,39 @@ struct WebViewAttributes<'a> {
   /// Whether JavaScript should be disabled.
   pub javascript_disabled: bool,
 
+  /// A handler to intercept permission requests from the webview.
+  ///
+  /// The handler receives the [`PermissionKind`] and should return
+  /// the desired [`PermissionResponse`].
+  ///
+  /// > [!NOTE]
+  /// > This handler only triggers for new permission requests. If the user has already
+  /// > allowed or denied a permission persistently within the webview, the browser
+  /// > will use the saved preference instead of calling this handler.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows**: Fully supported via WebView2's PermissionRequested event.
+  /// - **macOS / iOS**: Fully supported via WKUIDelegate's requestMediaCapturePermission.
+  /// - **Linux**: Fully supported via WebKitGTK's permission-request signal.
+  /// - **Android**: Supported via JNI bridge for geolocation, microphone, camera,
+  ///   protected media, and MIDI requests. Android runtime permissions may still
+  ///   trigger native OS prompts before access is granted.
+  ///
+  /// ## Example
+  ///
+  /// ```no_run
+  /// # use wry::{WebViewBuilder, PermissionKind, PermissionResponse};
+  /// let webview = WebViewBuilder::new()
+  ///     .with_permission_handler(|kind| {
+  ///         match kind {
+  ///             PermissionKind::Microphone => PermissionResponse::Allow,
+  ///             PermissionKind::Camera => PermissionResponse::Allow,
+  ///             _ => PermissionResponse::Default,
+  ///         }
+  ///     });
+  /// ```
+  pub permission_handler: Option<Box<dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync>>,
   /// Controls the WebView's browser-level general autofill behavior.
   ///
   /// **This option does not disable password or credit card autofill.**
@@ -850,6 +882,7 @@ impl Default for WebViewAttributes<'_> {
       }),
       background_throttling: None,
       javascript_disabled: false,
+      permission_handler: None,
       general_autofill_enabled: true,
     }
   }
@@ -1264,6 +1297,44 @@ impl<'a> WebViewBuilder<'a> {
     self
   }
 
+  /// Set a handler to intercept permission requests from the webview.
+  ///
+  /// The handler receives the [`PermissionKind`] and should return
+  /// the desired [`PermissionResponse`].
+  ///
+  /// > [!NOTE]
+  /// > This handler only triggers for new permission requests. If the user has already
+  /// > allowed or denied a permission persistently within the webview, the browser
+  /// > will use the saved preference instead of calling this handler.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows**: Fully supported via WebView2's PermissionRequested event.
+  /// - **macOS / iOS**: Fully supported via WKUIDelegate's requestMediaCapturePermission.
+  /// - **Linux**: Fully supported via WebKitGTK's permission-request signal.
+  /// - **Android**: Supported via JNI bridge with some limitations (WIP).
+  ///
+  /// ## Example
+  ///
+  /// ```no_run
+  /// # use wry::{WebViewBuilder, PermissionKind, PermissionResponse};
+  /// let webview = WebViewBuilder::new()
+  ///     .with_permission_handler(|kind| {
+  ///         match kind {
+  ///             PermissionKind::Microphone => PermissionResponse::Allow,
+  ///             PermissionKind::Camera => PermissionResponse::Allow,
+  ///             _ => PermissionResponse::Default,
+  ///         }
+  ///     });
+  /// ```
+  pub fn with_permission_handler<F>(mut self, handler: F) -> Self
+  where
+    F: Fn(PermissionKind) -> PermissionResponse + Send + Sync + 'static,
+  {
+    self.attrs.permission_handler = Some(Box::new(handler));
+    self
+  }
+
   /// Set a download started handler to manage incoming downloads.
   ///
   /// The closure takes two parameters, the first is a `String` representing the url being downloaded from and and the
@@ -1673,6 +1744,7 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
   extension_path: Option<PathBuf>,
   default_context_menus: bool,
   environment: Option<ICoreWebView2Environment>,
+  profile_name: Option<String>,
 }
 
 #[cfg(windows)]
@@ -1688,6 +1760,7 @@ impl Default for PlatformSpecificWebViewAttributes {
       browser_extensions_enabled: false,
       extension_path: None,
       environment: None,
+      profile_name: None,
     }
   }
 }
@@ -1772,6 +1845,19 @@ pub trait WebViewBuilderExtWindows {
   /// Set the environment for the webview.
   /// Useful if you need to share the same environment, for instance when using the [`WebViewBuilder::with_new_window_req_handler`].
   fn with_environment(self, environment: ICoreWebView2Environment) -> Self;
+
+  /// Set the WebView2 profile name for this webview. Webviews with different
+  /// profile names within the same environment have isolated cookies, storage,
+  /// IndexedDB, cache, and other site data, while sharing the runtime.
+  ///
+  /// When `None` (the default), the webview uses the unnamed default profile.
+  ///
+  /// See <https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/multi-profile-support>
+  /// for the underlying WebView2 multi-profile feature.
+  ///
+  /// Profile names must follow the WebView2 naming rules (alphanumeric, `.`,
+  /// `_`, `-`, ` `, up to 64 chars, not starting/ending with `.` or ` `).
+  fn with_profile_name<S: Into<String>>(self, name: S) -> Self;
 }
 
 #[cfg(windows)]
@@ -1818,6 +1904,11 @@ impl WebViewBuilderExtWindows for WebViewBuilder<'_> {
 
   fn with_environment(mut self, environment: ICoreWebView2Environment) -> Self {
     self.platform_specific.environment.replace(environment);
+    self
+  }
+
+  fn with_profile_name<S: Into<String>>(mut self, name: S) -> Self {
+    self.platform_specific.profile_name = Some(name.into());
     self
   }
 }

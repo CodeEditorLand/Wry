@@ -596,8 +596,11 @@ impl InnerWebView {
       let proto_navigation_policy_delegate = ProtocolObject::from_ref(&*navigation_policy_delegate);
       webview.setNavigationDelegate(Some(proto_navigation_policy_delegate));
 
-      let ui_delegate: Retained<WryWebViewUIDelegate> =
-        WryWebViewUIDelegate::new(mtm, attributes.new_window_req_handler);
+      let ui_delegate: Retained<WryWebViewUIDelegate> = WryWebViewUIDelegate::new(
+        mtm,
+        attributes.new_window_req_handler,
+        attributes.permission_handler,
+      );
       let proto_ui_delegate = ProtocolObject::from_ref(&*ui_delegate);
       webview.setUIDelegate(Some(proto_ui_delegate));
 
@@ -1347,7 +1350,7 @@ r#"Object.defineProperty(window, 'ipc', {
 
 pub fn url_from_webview(webview: &WKWebView) -> Result<String> {
   let url_obj = unsafe { webview.URL().unwrap() };
-  let absolute_url = unsafe { url_obj.absoluteString().unwrap() };
+  let absolute_url = url_obj.absoluteString().unwrap();
 
   let bytes = {
     let bytes: *const c_char = absolute_url.UTF8String();
